@@ -17,7 +17,16 @@
 1. **现有语义内的直接化**：AICPU 继续生成 STARS SQE，但减少中间 task/transport 封装，直接生成 RDMA doorbell 相关 SQE。这与当前 `RDMA_DB_SEND_SQE` 思路一致，只是进一步压缩软件层。
 2. **绕过 STARS 的裸 RDMA WQE 路径**：AICPU 直接写 RDMA NIC 的 send queue/WQE，并直接写 doorbell，STARS 不再参与通信任务调度。这是更激进的方案。
 
-下文主要分析第二种方案。
+## 性能优先视角下的修正判断
+
+如果目标是极致性能，不能简单地认为“保留 STARS 更稳妥”。NVIDIA 的方向已经证明：对 MoE、小包 alltoall、kernel 内触发 one-sided 通信这类场景，device/kernel initiated networking 是重要方向。NCCL 2.28 引入 Device API 与 GIN；GIN 的设计目标就是让 CUDA kernel 内调用远端内存操作，并通过 GPUDirect Async Kernel-Initiated backend 利用 DOCA GPUNetIO 做 GPU-to-NIC 直连通信，同时保留 Proxy backend 作为兼容路径。
+
+因此真正的问题不是“直驱有没有性能优势”，而是：
+
+- 发起方是 AI Core / AIV kernel，还是 AICPU？
+- 直接填的是 NIC WQE，还是填 STARS RDMA doorbell SQE？
+- completion、ordering、资源回收、错误处理是否仍有硬件/firmware/driver 支撑？
+- 是否只针对规则小包通信 fast path，而不是覆盖所有 collective 主路径？
 
 ## 可行性判断
 
@@ -49,6 +58,10 @@
 
    如果大量网络操作不进入 STARS RTSQ，STARS SQ 深度、tail/head 查询、SQ 满等待等压力会下降。
 
+5. **支持真正细粒度计算通信融合**
+
+   如果未来不是 AICPU，而是 AI Core kernel 或 CCU 在数据准备好后立即触发 RDMA，就可以减少“算子完成后再由控制面启动通信”的间隙，更接近 NVIDIA GIN/NVSHMEM/DeepEP 方向。
+
 ## 主要劣势和风险
 
 1. **破坏统一 stream 语义**
@@ -75,24 +88,32 @@
 
    STARS 可以统一看到本地 copy、reduce、notify、event、doorbell 的依赖关系。完全绕过后，网络调度和本地调度割裂，后续做计算通信融合、QoS、优先级、profiling、重放等都更难。
 
-## 建议方案
+## 推荐方案：性能优先的 fast path
 
-不建议第一阶段做“完全绕过 STARS 的裸 RDMA WQE”。更合理的是三阶段演进：
+不建议把所有 HCCL 集合通信都改成裸 RDMA WQE，但建议明确建设一个高性能 fast path：
 
-1. **短期：保留 STARS，优化 AICPU 生成 SQE 的 batch 路径**
+1. **短期：AICPU + WQE template + batch doorbell**
 
-   聚焦 `BatchWrite/BatchRead/WriteWithNotify/WriteReduceWithNotify` 等路径，减少 per-instruction 动态分派、对象构造、transport 查询和重复地址计算。
+   通信域建链阶段预生成每个 peer/link 的 WQE 模板；执行时 AICPU 只 patch local offset、remote offset、length、imm/notify 等字段；多个 peer/chunk 合并 doorbell。
 
-2. **中期：引入 RDMA WQE template / command list**
+2. **中期：保留 STARS ordering，但跳过高层 task 解释开销**
 
-   通信域建链阶段预生成每个 peer/link 的 WQE 模板；算子执行时 AICPU 只 patch addr、len、rkey、imm data 等少量字段，然后通过一个 STARS SQE 或硬件 command list 触发一批 RDMA WQE。
+   对 `BatchWrite/BatchRead/AlltoAll/Dispatch/Combine` 这类规则通信，直接从 op desc 生成 compact command list，不再逐条走复杂 transport/instruction 解释。
 
-3. **长期：把高频 WQE 生成下沉到更靠近网卡/CCU 的硬件或固件**
+3. **长期：AI Core/CCU/NIC 发起通信**
 
-   AICPU 只提交高级 batch descriptor，例如 `{peer, local_offset, remote_offset, len, op, notify}`，由 NIC/CCU/firmware 展开 WQE、做 doorbell 合并、处理 completion。这样既减少 AICPU 负担，又保留统一资源管理和可观测性。
+   真正对齐 NVIDIA 的不是“AICPU 直驱”，而是“计算 kernel 或专用通信单元直接触发网络”。AICPU 可以负责建链和生成模板，数据面触发应尽量靠近数据生产者或网卡。
 
 ## 结论
 
-AICPU 直接填 RDMA WQE 在技术上不是不可能，但它更像是“绕过运行时调度器的 fast path”。它的收益主要体现在小包、高频、规则化通信场景；代价是破坏 STARS 的统一调度语义，并把 completion、错误恢复、资源隔离、跨芯片兼容、DFX/profiling 等复杂性全部上移到 HCCL/AICPU 代码。
+从性能角度看，直驱大概率是正确方向，尤其适合小包、高频、规则化通信：MoE dispatch/combine、batch write、alltoall direct fullmesh、one-sided write/reduce 等。NVIDIA 的 GIN/NVSHMEM/DeepEP 路线也说明，GPU/kernel initiated communication 是降低控制面延迟和实现计算通信融合的重要方向。
 
-推荐方向不是完全绕过 STARS，而是：**AICPU 负责生成更粗粒度的通信 batch descriptor，STARS/CCU/NIC 负责保持顺序、触发 doorbell、处理 completion 和错误。** 对 dispatch/combine、batch write、alltoall 这类规则通信，可以重点验证 WQE template + batch doorbell 的收益。
+但落到 Ascend/HCCL，第一优先级不应是“让 AICPU 裸写所有 NIC WQE”，而应是：
+
+- 建链阶段预生成 RDMA WQE/template；
+- AICPU 执行时只 patch 少数字段；
+- 对规则小包通信走 fast path；
+- ordering/completion/error 由 STARS/CCU/NIC firmware 保底；
+- 长期把触发点从 AICPU 推到 AI Core kernel 或 CCU。
+
+一句话：**为了性能，应该做直驱；但最优直驱不是 AICPU 变成 RDMA 驱动，而是 AICPU 生成模板，AI Core/CCU/NIC 在数据面快速触发。**
