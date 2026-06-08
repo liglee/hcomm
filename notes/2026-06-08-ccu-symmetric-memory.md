@@ -2,70 +2,83 @@
 
 日期：2026-06-08
 
-## 结论
+## 修正后的核心结论
 
-CCU 支持对称内存有意义，但在“CCU kernel 首轮同步已经交换 peer VA，并且后续可以直接访问 peer user buffer”的前提下，收益边界需要重新收敛。
+对称内存不是某一种地址计算方式，而是一种**提前注册的跨 rank 共享内存窗口语义**：所有 rank 以 collective 方式注册一段 buffer/window，注册阶段完成远端可访问地址、权限、token/key、生命周期等信息的建立和交换，运行阶段用 `winHandle + peerRank + offset` 访问对端 window。
 
-此时对称内存不再主要提供“去 staging copy”的收益，因为当前 CCU 路径本身已经不依赖 CCL staging buffer。它可能带来的性能收益主要剩下：
+ZBVA / iova=0 不是和对称内存并列的另一条路径，而是实现对称内存的一种手段。没有提前注册，就没有稳定的 window、token/key、iova=0 映射关系，也就谈不上直接使用 ZBVA。
 
-1. 减少每次 kernel 首轮同步时的 VA exchange；
-2. 减少 peer VA 表、地址表、descriptor 的加载和保存；
-3. 简化 CCU 指令序列里的远端地址生成；
-4. 降低 SQE 参数数量和 CCU XN/GSA 等资源压力；
-5. 有利于 graph/replay、persistent window、MoE dispatch/combine 这类重复窗口路径。
+在 CCU 场景下，价值判断应该改成：
 
-如果现有 CCU VA exchange 只在通信域初始化或 template 初始化时做一次，后续所有 op 都复用 peer VA，那么对称内存的运行时性能优势会很小，甚至可能不值得引入复杂的 VA 预留、物理页映射和生命周期管理。
+```text
+非对称动态路径：
+    每次 CCU kernel 启动时交换 peer VA / remote descriptor。
 
-如果硬件/驱动支持 ZBVA 或 iova=0，则地址计算收益进一步降低：remote address 可以直接使用 buffer 内 offset，而不需要 `base + stride * peer + offset`。此时运行时仍然不能省掉的是 token/key/channel/context。
+对称内存路径：
+    注册阶段建立 stable window descriptor，运行时只传 winHandle/peer/offset/len。
+
+ZBVA-backed 对称内存路径：
+    注册阶段把每个 peer window 的 remote address base 建成 0；
+    运行时 remote addr = offset；
+    但 token/key/channel/context 仍来自注册期建立的 window descriptor。
+```
+
+所以，如果当前非对称 CCU kernel 每次启动都要交换内存信息，那么对称内存仍然有性能价值；如果对称内存进一步用 ZBVA 实现，则运行时地址生成可以进一步压缩到 offset，收益更干净。
 
 ## 与已有 CCU VA exchange 路径的关系
 
-已有 CCU 路径：
+已有非对称 CCU 路径：
 
 ```text
-kernel 首轮同步：每个 rank 把本端 VA 写给 peer
-运行阶段：每个 rank 根据 peer VA 直接 Read/Write 对端 user buffer
+kernel 首轮同步：每个 rank 把本端 VA 或 remote descriptor 写给 peer
+运行阶段：每个 rank 根据 peer VA / descriptor 直接 Read/Write 对端 user buffer
 ```
 
-对称内存路径：
+注册式对称内存路径：
 
 ```text
-注册阶段：所有 rank 建立一致的 symmetric VA/window 布局
-运行阶段：peer addr = base + stride * peer + offset
+注册阶段：所有 rank collective register window
+          建立 peer window 的远端访问描述符
+          交换/固化 addr、size、token/key、权限、lifetime
+
+运行阶段：CCU kernel 使用 winHandle + peerRank + offset + len
 ```
 
-ZBVA / iova=0 路径：
+若底层用普通 peer VA / symmetric heap 实现，则运行时地址可能是：
 
 ```text
-注册阶段：每个 rank/window 的远端可访问地址基准为 0
-运行阶段：peer addr = offset
+remote_addr(peer, offset) = base(peer) + offset
+或
+remote_addr(peer, offset) = heapBase + stride * peer + windowOffset + offset
 ```
 
-三者都可以做到直接访问 peer user buffer。区别不在于是否 zero-copy，而在于地址获取方式：
+若底层用 ZBVA/iova=0 实现，则运行时地址可以是：
 
-- 现有 CCU 路径是“动态交换 VA”；
-- 对称内存路径是“注册期建立确定性地址公式”；
-- ZBVA 路径是“把 remote base 固定为 0，运行时直接使用 offset”。
+```text
+remote_addr(peer, offset) = offset
+```
+
+但这个 offset 能成立的前提，是注册阶段已经把 peer window 映射成 zero-based remote address space，并且 token/key/context 已经作为 window descriptor 固化下来。
 
 ## 内存语义与网络语义的差异
 
 ### 内存语义
 
-如果底层支持内存语义，远端访问凭据可以被抽象成“peer VA 可访问”。此时每次 kernel 交换 VA 后，CCU 直接拿 peer VA 做 Read/Write。对称内存只是把 peer VA 动态交换替换成固定公式。
+如果底层支持内存语义，远端访问凭据可以近似抽象成“peer VA 可访问”。非对称路径每次 kernel 交换 peer VA 后就能直接访问；对称内存路径把这类交换提前到注册阶段。
+
+ZBVA-backed 对称内存进一步把 peer VA/base 抹掉，使运行时只需要 offset。
 
 ### 网络语义 / URMA 语义
 
-如果 CCU 调度的是 URMA/RDMA-like 网络语义，仅有 VA 不够。远端访问至少需要：
+如果 CCU 调度的是 URMA/RDMA-like 网络语义，仅有 VA 或 offset 不够。远端访问至少需要：
 
 ```text
-remote addr + length + remote token/key + channel/endpoint/QP-like context
+remote addr/offset + length + remote token/key + channel/endpoint/entity/QP-like context
 ```
 
 HCOMM next 代码中 `CcuTransport::CclBufferInfo` 明确包含 `addr`、`size`、`tokenId`、`tokenValue`。`CcuRepRemMem::Translate` 会从 channel 获取 remote buffer 的 addr/size/tokenId/tokenValue，然后把 addr 加载到 GSA，把 token 信息加载到 XN。后续 `ReadNb/WriteNb` 指令使用 remote addr 和 remote token 执行传输。
 
-因此，在网络语义下，对称内存最多减少 remote addr 的动态交换和地址表复杂度，不能消除 token/key/context。除非 token 也被设计成 symmetric window 的稳定属性，并在注册/建链阶段完成交换，否则运行时仍然要有 token 获取或 token descriptor。
-
-ZBVA/iova=0 可以把 `remote addr` 进一步压缩成 `offset`，但仍然需要 token/key/context。换言之，ZBVA 解决的是 remote address base 问题，不解决 remote access authority 问题。
+因此，ZBVA 只解决 remote address base 问题，不解决 remote access authority 问题。对称内存注册必须同时把 token/key/context 纳入 window descriptor，才能真正减少运行时交换。
 
 ## HCOMM 代码依据
 
@@ -88,7 +101,7 @@ heapBase + stride * rank + alignedHeapOffset
 
 每个 rank 预留同样大小的 VA heap；本地 PA 导出为 shareable handle，所有 rank exchange handle，然后把每个 rank 的物理内存映射到本进程 VA heap 的对应 slot。这样任意 rank 都可以用同一套公式计算 peer buffer 地址。
 
-如果有 ZBVA/iova=0，网络语义下不再需要构造 `heapBase + stride * rank + offset` 这样的 remote addr。每个 rank 的 remote addr 可以统一表示为 window 内 offset。peer rank 的区分交给 channel/context/token，而不是 remote addr 高位或 stride slot。
+这是一种“VA heap/stride”实现方式；如果底层支持 ZBVA/iova=0，则可以把 peer window 的 remote base 统一成 0，使运行时地址从 `base + offset` 退化成 `offset`。但这仍然属于对称内存注册的实现细节，不是独立于对称内存之外的机制。
 
 ### AllToAll fast path
 
@@ -98,21 +111,17 @@ heapBase + stride * rank + alignedHeapOffset
 
 ### CCU 适配切入点
 
-`pkg_inc/hcomm/ccu/ccu_kernel.h` 中 CCU 已经有 `CreateRemoteAddr`、`GetRemoteAddr`、`ReadNb`、`WriteNb`、`ReadReduceNb`、`WriteReduceNb` 等远端内存操作抽象。对称内存接入 CCU 的本质，是把远端地址生成和 window 映射标准化：
+`pkg_inc/hcomm/ccu/ccu_kernel.h` 中 CCU 已经有 `CreateRemoteAddr`、`GetRemoteAddr`、`ReadNb`、`WriteNb`、`ReadReduceNb`、`WriteReduceNb` 等远端内存操作抽象。对称内存接入 CCU 的本质，是把远端访问描述符从运行时动态交换改成注册期固化：
 
 ```text
-remote_addr(peer, user_offset) = heapBase + stride * peer + alignedHeapOffset + user_offset
+非 ZBVA 对称内存：
+    remote_addr = base(peer) + offset
+    token/key   = winDesc.token(peer)
+
+ZBVA-backed 对称内存：
+    remote_addr = offset
+    token/key   = winDesc.token(peer)
 ```
-
-在已有 VA exchange 机制下，这不是从 staging 到 zero-copy 的改变，而是从“运行期动态交换地址”变成“注册期建立确定性地址公式”。
-
-如果采用 ZBVA/iova=0，则 CCU remote addr 可以简化为：
-
-```text
-remote_addr = user_offset
-```
-
-此时 CCU 对称内存 fast path 的收益不再是减少地址计算，而主要是减少动态 VA exchange、统一 window 生命周期和 token/key 描述符管理。
 
 ### CCU URMA channel 当前限制
 
@@ -122,32 +131,32 @@ remote_addr = user_offset
 
 ### 有收益的情况
 
-1. VA exchange 每次 op 或每次 kernel 都发生，且首轮同步在小消息中占比高。
-2. peer 数较多，例如 8P/16P fullmesh，每个 peer 都需要保存和加载 VA。
-3. AllToAllV/AllToAllVC/MoE dispatch-combine 中每轮都要根据 peer + offset 形成大量远端地址。
+1. 非对称路径中，VA 或 remote descriptor 每次 op/kernel 都发生交换，且首轮同步在小消息中占比高。
+2. peer 数较多，例如 8P/16P fullmesh，每个 peer 都需要保存和加载 VA/token descriptor。
+3. AllToAllV/AllToAllVC/MoE dispatch-combine 中每轮都要形成大量远端访问描述符。
 4. SQE 参数数量、CCU Load 指令数量、XN/GSA 资源成为瓶颈。
-5. 需要 graph replay / persistent kernel / persistent communication window，运行时不希望再做动态地址交换。
-6. 网络语义下如果 token/key 可以注册期交换并作为 window descriptor 稳定复用，可以减少运行时 token 获取和 descriptor 装载。
+5. 需要 graph replay / persistent kernel / persistent communication window，运行时不希望再做动态地址/descriptor 交换。
+6. 网络语义下，token/key 可以注册期交换并作为 window descriptor 稳定复用。
+7. 如果底层支持 ZBVA/iova=0，运行时 remote addr 可直接用 offset，进一步减少地址装载和计算。
 
 ### 收益很小的情况
 
-1. peer VA 在通信域初始化时已经交换，并且跨 op 长期复用。
-2. 地址表常驻 CCU buffer/register，不在关键路径重复加载。
+1. peer VA/token descriptor 在通信域初始化时已经交换，并且跨 op 长期复用。
+2. 地址表/token 表常驻 CCU buffer/register，不在关键路径重复加载。
 3. 通信主要受链路带宽或 DMA engine 吞吐限制。
 4. 大包 AllReduce/AllGather 已经通过 pipeline 打满带宽。
 5. window 注册成本无法 amortize，例如一次性临时 buffer。
-6. 网络语义下 token/key 每次仍需动态交换或重新注册，对称内存只能减少 addr，不减少完整远端访问凭据。
-7. 如果 ZBVA/iova=0 已经可用，地址计算本身不再是关键收益点，对称内存必须在 token/key 生命周期管理或减少 VA exchange 上体现价值。
+6. 对称内存只做了地址对称，没有把 token/key/context 纳入注册期稳定 descriptor；这种情况下网络语义收益不完整。
 
 ## 设计建议
 
-1. 先测量当前 CCU 路径首轮 VA exchange 的耗时和占比。如果只占极小比例，不要为了对称内存重构数据面。
-2. 对 MoE dispatch/combine、AllToAllVC 这类 repeated window 小中消息路径，可以做 symmetric-window fast path。
-3. CCU kernel 参数中优先传 `offset` 或压缩 win descriptor；在支持 ZBVA/iova=0 时，不需要传 `base/stride/windowOffset` 来计算 remote addr。
-4. 网络语义下，window descriptor 不能只包含 addr/offset，还必须包含 token/key/context 索引。建议设计为 `winHandle -> {offset/size, tokenId/tokenValue 或 tokenIndex, channelId/entity/eid}`。如果不支持 ZBVA，再额外包含 `base/stride/rankOffset`。
-5. 保留现有 CCU VA exchange 路径作为 fallback，避免对称内存 VA 预留失败、跨通信域冲突或一次性 buffer 场景拖慢。
-6. 多通信域、多 group 下必须明确 window namespace、stride 和 lifetime，避免不同 group 复用相同用户 VA 时出现资源冲突。
+1. 明确把“对称内存”定义成注册式 window 语义，不要把 ZBVA 和对称内存并列。
+2. 对 CCU 网络语义，window descriptor 不能只包含 addr/offset，必须包含 token/key/context 索引。
+3. 如果支持 ZBVA/iova=0，CCU kernel 参数优先只传 `winHandle + peerRank + offset + len`，由 win descriptor 提供 peer token/context。
+4. 如果不支持 ZBVA，则 win descriptor 需要额外包含 `base/stride/rankOffset`。
+5. 保留现有非对称 VA exchange 路径作为 fallback，用于一次性 buffer、注册失败、跨通信域冲突或旧硬件。
+6. 多通信域、多 group 下必须明确 window namespace、stride/token lifetime，避免不同 group 复用相同用户 VA 时出现资源冲突。
 
 ## 一句话判断
 
-在 CCU 已经通过首轮同步交换 peer VA、并能直接访问 peer user buffer 的前提下，对称内存仍然有工程价值，但性能优势主要来自“减少动态 VA exchange 和地址描述开销”，不是来自“去 staging copy”。如果走 URMA/RDMA-like 网络语义，远端访问不仅需要 VA，还至少需要 token/key/context。若进一步支持 ZBVA/iova=0，remote addr 可退化成 offset，地址计算收益基本消失；剩余关键价值是把 token/key/context 也纳入稳定 window descriptor，减少运行时远端访问凭据交换。
+对称内存是提前注册的跨 rank window 语义，ZBVA/iova=0 是实现对称内存的一种方式。若 CCU 非对称路径每次 kernel 启动都要交换内存信息，对称内存有明确性能价值；若再用 ZBVA 实现，运行时 remote addr 可以退化成 offset。但在 URMA/RDMA-like 网络语义下，offset 不能单独完成远端访问，token/key/channel/context 必须随对称 window 在注册期固化，否则收益不完整。
