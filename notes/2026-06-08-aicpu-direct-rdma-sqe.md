@@ -88,6 +88,50 @@
 
    STARS 可以统一看到本地 copy、reduce、notify、event、doorbell 的依赖关系。完全绕过后，网络调度和本地调度割裂，后续做计算通信融合、QoS、优先级、profiling、重放等都更难。
 
+## AICPU 填 WQE 的加速办法
+
+用户进一步提出：不用 AI Core 是为了避免占计算资源，那么 AICPU 如果填 WQE 慢，是否可以通过 CPU SIMD 加速？结论如下：
+
+1. **Host CPU SIMD 不适合放在 hot path**
+
+   Host CPU 的 AVX/NEON/SVE 可以在建链阶段或 launch 前生成模板，但如果每次通信都依赖 Host CPU SIMD 生成 WQE，再拷贝到 device/NIC 可见内存，PCIe/Host-device 同步延迟会抵消收益，也破坏 graph/offload/AICPU 下沉的初衷。
+
+2. **AICPU SIMD/宽 store 可以用，但不是第一收益点**
+
+   如果 AICPU ISA 暴露 NEON/SVE 或等价向量 load/store，可以用于批量复制 64B/128B WQE template、批量 patch 连续字段、批量写 doorbell record。它能减少指令条数，但 WQE 生成通常更受内存写入、cacheline、barrier、doorbell MMIO、PI 更新限制，而不是算术计算限制。
+
+3. **更重要的是 WQE 模板化**
+
+   建链阶段预生成完整 WQE template，运行时只 patch 4～6 个字段：local address、remote address、length、imm/notify、PI/sequence、maybe rkey。这样从“构造 WQE”变成“复制模板 + patch 少数字段”。
+
+4. **使用 SoA/patch list 而不是 AoS 全量重算**
+
+   固定字段集中放在 template，变化字段形成 patch list。AICPU 按连续数组批量写入变化字段，避免多层对象、虚函数、branch、map 查询、transport 查找。
+
+5. **用 SDMA/内部 DMA 复制大批模板**
+
+   如果一次需要生成几十到几百条 WQE，可以先让 AICPU 下发一次本地 DMA，把 template block 批量复制到 send queue shadow buffer，再由 AICPU patch 少量字段。这样 AICPU 不负责大块 memcpy，只负责少量 store。
+
+6. **批量 doorbell / doorbell coalescing**
+
+   不要每条 WQE 一次 doorbell。每个 QP 保持 per-QP pending count，批量写完 N 条 WQE 后再敲一次 doorbell。对 alltoall/dispatch/combine，doorbell 合并可能比 SIMD 更有收益。
+
+7. **多 AICPU worker / per-QP 并行**
+
+   如果硬件允许多个 AICPU 线程/核并行，可按 QP、peer、stream、rank group 切分，每个 worker 操作独立 SQ ring，避免锁竞争。最后只需要轻量级聚合 completion/notify。
+
+8. **减少 barrier 和 cache flush 次数**
+
+   WQE memory 先普通写，最后批量执行一次 release barrier / cache clean / doorbell。避免每条 WQE 后都 barrier。
+
+9. **用 compact command list 替代逐条 WQE**
+
+   对规则通信，AICPU 甚至不应生成每条 WQE，而是生成 `{base, stride, count, peer_mask, len, op}` 形式的 compact descriptor，由 NIC/CCU/firmware 展开。这样 AICPU 工作量从 O(num_wqe) 降到 O(num_pattern)。
+
+10. **避免 C++ 重对象路径**
+
+    当前 HCOMM 路径里有 instruction interpret、transport 查询、对象封装、task mirror 等开销。fast path 应采用 plain C struct + inline function + precomputed pointer，避免动态分派、map 查找、日志、profiling 全量记录。
+
 ## 推荐方案：性能优先的 fast path
 
 不建议把所有 HCCL 集合通信都改成裸 RDMA WQE，但建议明确建设一个高性能 fast path：
